@@ -1,0 +1,441 @@
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(prophet)
+library(data.table)
+library(tis)
+library(caret)
+library(glmnet)
+library(timetk)
+
+##################################################
+tbats_forecast <- function(x, h){
+  
+  tryTest = try(
+    {
+      # tbats_model <- x %>%
+      #   log() %>%
+      #   tbats() %>%
+      #   forecast(h = f_horizon)
+      if (length(x)>52){
+        
+        tbats_model = tbats(x)
+        tbats_fst <-  forecast(tbats_model,h=h)$mean 
+        
+      } else {
+        
+        tbats_fst <- mean(x)        
+        
+        
+      }
+    }
+    ,silent=TRUE)
+  
+  if(debug==TRUE){
+    
+    residual_analysis(tbats_model)
+  }
+  
+  if(class(tryTest)=='try-error') tbats_fst=rep(x[length(x)],h)
+  
+  return(tbats_fst)
+  
+}
+
+
+autoarima_forecast <- function(x, h){
+  
+  tryTest = try(
+    {
+      #p <- periodogram(x)
+      #tbl <- data.table(period=1/p$freq, spec=p$spec)[order(-spec)][1]
+      
+      if (length(x)>52){
+        
+        arima_model  <- auto.arima(x, xreg=fourier(x,K=4), seasonal=FALSE)
+        arima_fst <- forecast(arima_model, xreg=fourier(arima_model$x, K=4, h=h))$mean
+        
+      } else {
+        
+        arima_fst <- mean(x)        
+        
+        
+      }
+      
+      
+    }
+    ,silent=TRUE)
+  
+  if(class(tryTest)=='try-error') arima_fst=rep(x[length(x)],h)
+  
+  
+  return(arima_fst)
+  
+}
+
+LASSO_forecast <- function(df_train_final_scaled, df_test_final_scaled){
+  
+  nrow(df_train_final_scaled)
+  nrow(df_test_final_scaled)
+  
+  tryTest = try(
+    {
+      x_train = model.matrix(Qty~., df_train_final_scaled)[,-1]
+      x_test = model.matrix(Qty~., df_test_final_scaled)[,-1]
+      nrow(x_train)
+      nrow(x_test)
+      
+      #nrow(df_train_final_scaled)
+      #nrow(df_test_final_scaled)
+      
+      y_train = as.vector(df_train_final_scaled$Qty)
+      y_test = as.vector(df_test_final_scaled$Qty)
+      
+      
+      lasso_mod = glmnet(x_train, 
+                         y_train, 
+                         alpha = 1) # Fit lasso model on training data
+      
+      if(debug == TRUE) {
+        plot(lasso_mod)    # Draw plot of coefficients
+      }
+      
+      set.seed(1)
+      cv.out = cv.glmnet(x_train, y_train, alpha = 1) # Fit lasso model on training data
+      if(debug == TRUE) {
+        plot(cv.out) # Draw plot of training MSE as a function of lambda
+      }
+      nrow(x_test)
+      
+      
+      bestlam = cv.out$lambda.min # Select lamda that minimizes training MSE
+      lasso_pred = predict(lasso_mod, s = bestlam, newx = x_test) # Use best lambda to predict test data
+      
+      lasso_coef = predict(lasso_mod, type = "coefficients", s = bestlam) # Display coefficients using lambda chosen by CV
+      lasso_coef = lasso_coef[1:nrow(lasso_coef),]
+      
+      lasso_coef_final = as.data.frame(lasso_coef[lasso_coef != 0]) # Display only non-zero coefficients
+      
+      coef_df <- cbind(Driver = rownames(lasso_coef_final), lasso_coef_final)
+      rownames(coef_df) <- 1:nrow(coef_df)
+      colnames(coef_df) = c('Driver','Importance')
+      
+    }
+    ,silent=TRUE)
+  
+  if(class(tryTest)=='try-error') {
+    
+    lasso_pred=rep(df_train_final_scaled[nrow(df_train_final_scaled),'Qty'],nrow(df_test_final_scaled))
+    coef_df=NULL
+    
+  }
+  
+  return(list(lasso_pred,coef_df))
+  
+}
+
+##Croston for intermittent demand
+# croston_forecast <- function(x, h, xreg) {
+#   fcst=try(
+#     {
+#       # fit <- forecast::naive(x)
+#       if(length(x)<=12 | sum(tail(x,min(12,length(x))))==0){
+#         
+#         forecast::ses(x,h=h)$mean
+#         
+#       } else {
+#       
+#       forecast::croston(x, h=h)$mean
+#         
+#       }
+#     }
+#     ,silent=TRUE)
+#   
+#   if(class(fcst)=='try-error') fcst=rep(x[length(x)],h)
+#   
+#   #  fcst=pmax(0,fcst)
+#   
+#   return(fcst)
+#   
+# }
+
+###Croston
+croston_forecast <- function(x, h, xreg) {
+  fcst=try(
+    {
+      # fit <- forecast::naive(x)
+      
+      forecast::croston(x, h=h)$mean
+    }
+    ,silent=TRUE)
+  
+  if(class(fcst)=='try-error') fcst=rep(x[length(x)],h)
+  
+  #  fcst=pmax(0,fcst)
+  
+  return(fcst)
+  
+}
+
+##Theta
+theta_forecast <- function(x,h,xreg) {
+  fcst=try(
+    { 
+      
+      forecast::thetaf(x, h)$mean
+    }
+    ,silent=TRUE)
+  
+  if(class(fcst)=='try-error' | length(fcst)==0) fcst=rep(x[length(x)],h)
+  
+  #  fcst=pmax(0,fcst)
+  
+  return(fcst)
+}
+
+prophet_forecast=function(x,h,xreg,MinDate=as.Date('2017-05-01')){
+  
+  fcst=try(
+    { 
+      
+      
+      if (length(x)>52){
+        
+        m<-prophet(yearly.seasonality = TRUE,seasonality.mode = 'additive')
+        
+        if (ncol(xreg)>=1){
+          
+          for (xregPr in colnames(xreg)){
+            m <- add_regressor(m, name=xregPr,standardize = FALSE)
+            #  m <- add_regressor(m, name=xregPr)
+            
+          }
+          
+          proph_df=cbind(data.frame(ds=MinDate+weeks(0:(length(x)-1)),y=x,xreg[1:length(x),]))
+          colnames(proph_df)=c('ds','y',colnames(xreg))
+          
+          m <- fit.prophet(m,df=proph_df)
+          future=cbind(make_future_dataframe(m,periods=h,freq='week'),xreg[1:(length(x)+h),])
+          colnames(future)=c('ds',colnames(xreg))
+          
+          
+        } else {
+          
+          proph_df=cbind(data.frame(ds=MinDate+weeks(0:(length(x)-1)),y=x))
+          
+          m <- fit.prophet(m,df=proph_df)
+          future=make_future_dataframe(m,periods=h,freq='week')
+          
+        }
+        
+        
+        proph_fcst<-predict(m,future)
+        fcst <- proph_fcst$yhat[(length(x)+1):(length(x)+h)]
+        
+        # prophet_plot_components(m,proph_fcst)  
+        # Proph_Coeffs=rbind(proph_fcst[nrow(proph_fcst),colnames(xreg)],xreg[nrow(xreg),])
+        # 
+        # print('Prophet Coefficients')
+        # print(Proph_Coeffs[1,]/Proph_Coeffs[2,])
+        
+      } else {
+        
+        fcst <- mean(x)        
+        
+        
+      }
+      
+      
+      
+    }
+    
+    ,silent=TRUE)
+  
+  if(class(fcst)=='try-error' | length(fcst)==0) fcst=rep(x[length(x)],h)
+  
+  #  fcst=pmax(0,fcst)
+  
+  #   print(fitArima)
+  return(fcst)
+  
+}
+
+normalize <- function(x)
+{
+  return((x- min(x)) /(max(x)-min(x)))
+}
+
+
+convert_to_TS <- function(df_material){
+  
+  tryTest = tryCatch(
+    {
+      # Format Time series
+      df_material$Week <- as.Date(df_material$Week)
+      
+      ts_length <- nrow(df_material)
+      #head(df_material)
+      
+      week <- as.Date(df_material$Week)
+      dt <- as.Date(week[1], format="%d/%m/%Y")
+      day = strtoi(format(dt,"%d"))
+      mon = strtoi(format(dt,"%m"))
+      yr = strtoi(format(dt,"%Y"))
+      
+      qty_ts = ts(df_material$Qty,  freq=365.25/7, start=(yr + mon*30 + day)/365.25)
+      #plot.ts(qty_ts)
+      
+      
+      if (debug == TRUE) {
+        plot.ts(qty_ts)
+      }
+      
+    }, 
+    error = function(e) {
+      print('Error in function = convert_to_TS')
+      print(e)
+      return('')
+    },
+    finally = {}
+  )
+  
+  
+  return(qty_ts)
+  
+}
+
+scale_to_TS <- function (qty_ts) {
+  
+  qty_min <- min(qty_ts) 
+  qty_max <- max(qty_ts)
+  #print(qty_ts)
+  
+  if(debug==TRUE) {
+    print( paste(" Scaling parameters :  ", "Max = ", qty_max, "Min = ", qty_min))
+  }
+  qty_ts_norm <- normalize(qty_ts)
+  qty_length <- length(qty_ts_norm)
+  if(debug==TRUE) {
+    plot.ts(qty_ts_norm)
+  }
+  rtn = list(qty_ts_norm,qty_max,qty_min)
+  
+  return(rtn)
+}
+
+
+features_scale <- function(df_material, f_horizon){
+  
+  tryTest = tryCatch(
+    {
+      #df_material[50,]
+      df_material[is.na(df_material)] <- 0
+      #df_material <- mice(df_material)
+      
+      df_time     <- df_material$Week
+      df_qty      <- df_material$Qty
+      str(df_material)
+      df_features <- df_material[-c(1)]
+      
+      pLen = nrow(df_material)
+      
+      df_train_week <- df_material[1:(pLen-f_horizon),]
+      df_test_week <- df_material[(pLen-f_horizon +1):pLen,]
+      
+      pLen = nrow(df_features)
+      
+      df_features_train <- df_features[1:(pLen-f_horizon),]
+      df_features_test <- df_features[(pLen-f_horizon +1):pLen,]
+      #nrow(df_features_train)
+      
+      df_qty_train <- df_qty[1:(pLen-f_horizon)]
+      df_qty_test <- df_qty[(pLen-f_horizon +1):pLen]
+      #df_qty_test
+      
+      preProcValues_train <- preProcess(na.omit(df_features_train), method = c("center", "scale"))
+      df_features_train_scaled <- predict(preProcValues_train, df_features_train)
+      if(debug == TRUE) {
+        glimpse(df_features_train_scaled)
+      }
+      preProcValues_test <- preProcess(na.omit(df_features_test), method = c("center", "scale"))
+      df_features_test_scaled <- predict(preProcValues_test, df_features_test)
+      if(debug == TRUE) {
+        glimpse(df_features_test_scaled)
+      }
+      
+      # Min-max scale predictor
+      df_qty_scaled = normalize(df_qty)
+      #summary(df_qty_scaled)
+      
+      # Split train and test
+      df_qty_train_scaled <- df_qty_scaled[1:(pLen-f_horizon)]
+      df_qty_test_scaled <- df_qty_scaled[(pLen-f_horizon +1):pLen]
+      
+      df_train_final_scaled = cbind(df_qty_train_scaled, df_features_train_scaled)
+      colnames(df_train_final_scaled)[colnames(df_train_final_scaled) == 'df_qty_train_scaled'] <- 'Qty'
+      
+      df_test_final_scaled = cbind(df_qty_test_scaled, df_features_test_scaled)
+      colnames(df_test_final_scaled)[colnames(df_test_final_scaled) == 'df_qty_test_scaled'] <- 'Qty'
+      
+    }, 
+    error = function(e) {
+      print('Error in function = features_scale')
+      print(e)
+      return('')
+    },
+    finally = {}
+  )
+  
+  
+  return( list(df_train_final_scaled, df_test_final_scaled, df_test_week$Week))
+  
+}
+
+
+
+
+features_scale_v2 <- function(df_material, f_horizon){
+  
+  tryTest = tryCatch(
+    {
+      #df_material[50,]
+      df_material[is.na(df_material)] <- 0
+      #df_material <- mice(df_material)
+      
+      df_time     <- df_material$Week
+      df_qty      <- df_material$Qty
+      str(df_material)
+      df_features <- df_material[,-c(1)]
+      
+      pLen = nrow(df_material)
+      # Min-max scale predictor
+      df_qty_scaled = normalize(df_qty)
+      #summary(df_qty_scaled)
+      
+      df_features_train_scaled <- df_features_scaled[1:(pLen-f_horizon),] 
+      df_features_test_scaled <- df_features_scaled[(pLen-f_horizon +1):pLen,]
+      
+      # Split train and test
+      df_qty_train_scaled <- df_qty_scaled[1:(pLen-f_horizon)]
+      df_qty_test_scaled <- df_qty_scaled[(pLen-f_horizon +1):pLen]
+      
+      df_train_final_scaled = cbind(df_qty_train_scaled, df_features_train_scaled)
+      colnames(df_train_final_scaled)[colnames(df_train_final_scaled) == 'df_qty_train_scaled'] <- 'Qty'
+      
+      df_test_final_scaled = cbind(df_qty_test_scaled, df_features_test_scaled)
+      colnames(df_test_final_scaled)[colnames(df_test_final_scaled) == 'df_qty_test_scaled'] <- 'Qty'
+      
+      
+    }, 
+    error = function(e) {
+      print('Error in function = features_scale')
+      print(e)
+      return('')
+    },
+    finally = {}
+  )
+  
+  
+  return( list(df_train_final_scaled, df_test_final_scaled))
+  
+}
